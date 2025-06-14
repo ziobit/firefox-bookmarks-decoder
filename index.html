@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Firefox Bookmark .jsonlz4 Viewer – DEBUG++</title>
+  <style>
+    body{font-family:sans-serif;margin:20px}
+    #drop-zone{border:2px dashed #999;padding:20px;text-align:center;margin-bottom:20px}
+    #output ul{list-style:none;padding-left:20px}
+    #output li{margin:4px 0}
+    #output a{text-decoration:none;color:#1a0dab}
+    #output a:hover{text-decoration:underline}
+    #debug{background:#f7f7f7;border:1px solid #ccc;padding:10px;margin-top:20px;
+           max-height:320px;overflow:auto;font-family:monospace;font-size:13px}
+  </style>
+</head>
+<body>
+<h1>Firefox Bookmark .jsonlz4 Viewer <small>(extra-debug)</small></h1>
+
+<div id="drop-zone">
+  Drop your <code>.jsonlz4</code> file here &nbsp;or&nbsp; <input type="file" id="file-input">
+</div>
+
+<div id="output"></div>
+<h2>Debug log</h2>
+<div id="debug">(nothing yet)</div>
+
+<script>
+/*-----------------------------------------------------------
+  LZ4 *block* decoder, faithful to spec + verbose failure
+-----------------------------------------------------------*/
+function decodeLz4BlockDbg(input, output, srcStart = 0, srcEnd = input.length){
+  let ip = srcStart;   // input ptr
+  let op = 0;          // output ptr
+
+  const dump = (p, n=8) =>
+    Array.from(input.slice(p, p+n)).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+
+  try {
+    while (ip < srcEnd) {
+      const token = input[ip++];
+
+      /*------------- literals -------------*/
+      let litLen = token >>> 4;
+      if (litLen === 15) {
+        let b;
+        do { b = input[ip++]; litLen += b; } while (b === 255);
+      }
+      // copy literals
+      output.set(input.subarray(ip, ip + litLen), op);
+      ip += litLen;
+      op += litLen;
+      if (ip >= srcEnd)     // stream ended on literals
+        return { ok:true, len:op };
+
+      /*------------- match -------------*/
+      const offset = input[ip] | (input[ip+1] << 8);
+      ip += 2;
+      if (!offset || offset > op)
+        return {ok:false, reason:'bad offset', atIn:ip-2, atOut:op,
+                details:{offset, snippet:dump(ip-4)}};
+
+      let matchLen = token & 0x0F;
+      if (matchLen === 15) {
+        let b;
+        do { b = input[ip++]; matchLen += b; } while (b === 255);
+      }
+      matchLen += 4;               // MINMATCH
+
+      // copy match (may overlap)
+      let ref = op - offset;
+      for (let k = 0; k < matchLen; k++)
+        output[op++] = output[ref++];
+
+    }
+  } catch (e) {
+    return { ok:false, reason:'exception', details:e.message, atIn:ip, atOut:op };
+  }
+  return { ok:true, len:op };
+}
+/*---------------------------------------------------------*/
+
+const MAGIC = [0x6d,0x6f,0x7a,0x4c,0x7a,0x34,0x30,0x00];   // "mozLz40\0"
+const oDiv  = document.getElementById('output');
+const dDiv  = document.getElementById('debug');
+const log   = m => {console.log(m); dDiv.innerHTML += `<pre>${m}</pre>`};
+const hex   = (a,off=0,n=16)=>Array.from(a.slice(off,off+n)).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+
+/* UI wiring */
+document.getElementById('file-input').addEventListener('change',e=>handle(e.target.files[0]));
+const dz=document.getElementById('drop-zone');
+dz.addEventListener('dragover',e=>e.preventDefault());
+dz.addEventListener('drop',e=>{e.preventDefault();handle(e.dataTransfer.files[0]);});
+
+/* main */
+function handle(f){
+  if(!f) return;
+  dDiv.textContent=''; oDiv.textContent='';
+  log(`File: ${f.name} (${f.size} B)`);
+
+  const fr=new FileReader();
+  fr.onerror=()=>log(`FileReader error: ${fr.error}`);
+  fr.onload=e=>process(new Uint8Array(e.target.result));
+  fr.readAsArrayBuffer(f);
+}
+
+function process(u8){
+  log(`Header bytes: ${hex(u8,0,16)}`);
+  for(let i=0;i<MAGIC.length;i++){ if(u8[i]!==MAGIC[i]){log('❌ wrong magic');return;} }
+  log('✅ Magic OK');
+
+  const usize = u8[8] | (u8[9]<<8) | (u8[10]<<16) | (u8[11]<<24);
+  log(`Uncompressed size (header): ${usize}`);
+
+  const out = new Uint8Array(usize);
+  const res = decodeLz4BlockDbg(u8, out, 12);
+
+  if(!res.ok){
+    log(`❌ LZ4 failed – ${res.reason}`);
+    if(res.details) log(JSON.stringify(res.details));
+    log(`Input @${res.atIn}: ${hex(u8, res.atIn-4, 8)}`);
+    log(`Output so far: ${res.atOut} B`);
+    return;
+  }
+  log(`Decompressed: ${res.len} B`);
+
+  const txt = new TextDecoder().decode(out.slice(0,res.len));
+  log(`JSON preview: ${txt.slice(0,100)}…`);
+
+  let data;
+  try{ data = JSON.parse(txt); log('✅ JSON parsed'); }
+  catch(e){ log(`❌ JSON parse error: ${e}`); return; }
+
+  const root = data.children ? data : (data.root || data);
+  oDiv.innerHTML = render(root);
+}
+
+/* simple tree renderer */
+function render(node){
+  if(!node) return '<p>No bookmarks found.</p>';
+  let h='<ul>'; (Array.isArray(node)?node:[node]).forEach(n=>h+=nodeHTML(n)); return h+='</ul>';
+}
+function nodeHTML(n){
+  let h='<li>';
+  if(n.type==='text/x-moz-place-container'){
+    h+=`<strong>${n.title||'[Folder]'}</strong>`;
+    if(n.children?.length){ h+='<ul>'; n.children.forEach(c=>h+=nodeHTML(c)); h+='</ul>'; }
+  }else if(n.type==='text/x-moz-place'){
+    h+=`<a href="${n.uri}" target="_blank">${n.title||n.uri}</a>`;
+  }
+  return h+='</li>';
+}
+</script>
+</body>
+</html>
